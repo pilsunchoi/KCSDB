@@ -11,18 +11,16 @@ config/settings.yaml
 # ==========================================
 # 데이터 (대용량, 외부 출처)
 # ==========================================
-data/raw/*
-!data/raw/.gitkeep
-data/interim/*
-!data/interim/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
+data/raw/
+data/interim/
+data/processed/
 *.duckdb
 *.duckdb.wal
 *.parquet
 *.csv
 !docs/**/*.csv
 !tests/**/*.csv
+!data/external/**/*.csv
 
 # ==========================================
 # Python
