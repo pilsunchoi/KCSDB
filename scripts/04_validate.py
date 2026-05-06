@@ -1,21 +1,30 @@
 """
-04: 적재된 DuckDB의 내부 일관성 검증
+04: 적재된 DuckDB의 내부 일관성 검증 (v2)
 
-8가지 자동 검증:
-1. fact_trade ↔ fact_total 합계 일관성 (같은 페어에서)
-2. fact_total 회계 항등식 (bal_payments = exp_dlr - imp_dlr)
-3. fact_trade 회계 항등식
-4. meta_calls ↔ fact 행수 무결성
-5. HS 파생 컬럼 일관성 (hs2/hs4/hs6 = hs10 슬라이싱)
-6. 페어 완전성 (모든 yyyymm × stat_cd가 meta_calls에 있는지)
-7. 시간 연속성 (빠진 월이 있는지)
-8. 음수 검증 (금액·중량 필드의 음수)
+기존 검증 9종 + dim 검증 6종 = 15종 (motie 포함 시 16종).
 
-선택적 외부 검증 (data/external/motie_monthly.csv 가 있으면):
-9. 산업통상자원부 월간 발표치 대조
+기본 검증:
+1a. fact_trade ↔ fact_total 금액 합계 일관성 (정확 일치)
+1b. fact_trade ↔ fact_total 중량 합계 일관성 (정보용 통계)
+2.  fact_total 회계 항등식 (bal_payments = exp_dlr - imp_dlr)
+3.  fact_trade 회계 항등식
+4.  meta_calls ↔ fact 행수 무결성
+5.  HS 파생 컬럼 일관성 (hs2/hs4/hs6 = hs10 슬라이싱)
+6.  페어 완전성 (fact_trade의 모든 페어가 meta_calls에 있는지)
+7.  시간 연속성 (200701~202605 빠진 월 없음)
+8.  음수 통계 (raw 자료 잔여, 정보용)
+9.  산업통상자원부 외부 대조 (선택, motie_monthly.csv 있을 때)
+
+dim 검증 (★v2 신규★, dim 테이블 존재 시만 실행):
+10. dim_country 행 수 = 244
+11. fact ↔ dim_country 매칭률 (fact_trade/fact_total/meta_calls)
+12. fact_trade.hs10 → dim_hs10 매칭률
+13. fact_trade.hs2 → dim_hs2 매칭률
+14. dim_hs10 시기 무결성 (first_yyyymm ≤ last_yyyymm, 범위 검증)
+15. dim_country 플래그 정합성 (is_self/call_status/has_trade가 fact와 일치)
 
 실행 예:
-  python scripts\04_validate.py
+  python scripts\\04_validate.py
 """
 
 from __future__ import annotations
@@ -75,6 +84,20 @@ class ValidationResult:
 
 
 # ──────────────────────────────────────────────
+# 보조 유틸
+# ──────────────────────────────────────────────
+
+def dim_tables_exist(con: duckdb.DuckDBPyConnection) -> bool:
+    """dim_country, dim_hs10, dim_hs2 모두 존재하는지 확인."""
+    rows = con.execute("""
+        SELECT table_name FROM duckdb_tables()
+        WHERE schema_name = 'main'
+          AND table_name IN ('dim_country', 'dim_hs10', 'dim_hs2')
+    """).fetchall()
+    return len(rows) == 3
+
+
+# ──────────────────────────────────────────────
 # 검증 1a: fact_trade ↔ fact_total 금액 합계 (정확 일치)
 # ──────────────────────────────────────────────
 
@@ -115,25 +138,22 @@ def check_trade_vs_total_dollars(con: duckdb.DuckDBPyConnection, r: ValidationRe
         """
         for row in con.execute(sql_detail).fetchall():
             logger.warning(f"      {row[0]}/{row[1]}: trade_sum={row[2]:,}, "
-                          f"total={row[3]:,}, diff={row[4]:,}")
+                           f"total={row[3]:,}, diff={row[4]:,}")
 
 
 # ──────────────────────────────────────────────
-# 검증 1b: fact_trade ↔ fact_total 중량 합계 (정보용 통계)
+# 검증 1b: fact_trade ↔ fact_total 중량 합계 (정보용)
 # ──────────────────────────────────────────────
 
 def check_trade_vs_total_weights(con: duckdb.DuckDBPyConnection, r: ValidationResult):
     """fact_trade 중량 합과 fact_total 중량 차이의 통계.
 
     raw 자료 자체에 들어 있는 ±수백 kg 수준 잔차가 약 70% 페어에 존재.
-    원인:
-    - 거래 행 건별 kg 미만 절상·절사
-    - 기밀 처리에 의한 일부 거래 중량 조정
-    - 후속 정정 보고의 부분 반영
+    원인: 거래 행 건별 kg 미만 절상·절사, 기밀 처리에 의한 일부 거래
+    중량 조정, 후속 정정 보고의 부분 반영.
 
-    금액(USD)은 1a에서 100% 일치 검증. 중량 차이는 분석에 영향 없음
-    (전체 무역량 대비 0.000x% 수준). 결함이 아닌 raw 자료의 특성으로
-    분류하여 검증 통과 처리하되 통계는 보고한다.
+    금액(USD)은 1a에서 100% 일치 검증. 중량 차이는 분석에 영향 없음.
+    raw 자료 특성으로 분류하여 항상 통과 처리 + 통계 보고.
     """
     sql = """
         WITH ts AS (
@@ -160,7 +180,6 @@ def check_trade_vs_total_weights(con: duckdb.DuckDBPyConnection, r: ValidationRe
     """
     total, n_diff, max_e, max_i, sum_abs, sum_total = con.execute(sql).fetchone()
 
-    # 전체 합계 대비 절대 차이 비율
     relative_total_pct = (sum_abs / sum_total * 100) if sum_total else 0
 
     detail = (f"불일치 {n_diff:,}/{total:,} 페어 "
@@ -269,8 +288,11 @@ def check_pair_completeness(con: duckdb.DuckDBPyConnection, r: ValidationResult)
 # ──────────────────────────────────────────────
 
 def check_time_continuity(con: duckdb.DuckDBPyConnection, r: ValidationResult):
-    """meta_calls의 yyyymm이 200701~202605 연속인지."""
-    # 기대 yyyymm 셋트 생성
+    """meta_calls의 yyyymm이 200701~202605 연속인지.
+
+    주의: expected 범위는 데이터셋 의도 범위(200701~202605)로 하드코딩됨.
+    데이터 갱신 시 이 함수의 expected 범위도 갱신 필요.
+    """
     expected = set()
     for year in range(2007, 2027):
         for month in range(1, 13):
@@ -294,7 +316,7 @@ def check_time_continuity(con: duckdb.DuckDBPyConnection, r: ValidationResult):
 
 
 # ──────────────────────────────────────────────
-# 검증 8: 음수 통계 (raw 자료 잔여, 결함 아님)
+# 검증 8: 음수 통계 (raw 자료 잔여)
 # ──────────────────────────────────────────────
 
 def check_negative_stats(con: duckdb.DuckDBPyConnection, r: ValidationResult):
@@ -302,7 +324,7 @@ def check_negative_stats(con: duckdb.DuckDBPyConnection, r: ValidationResult):
 
     raw 자료 자체에 들어 있는 정정·환수·통계 보정 잔여물.
     fact_trade 27.5M 행 대비 영향 < 0.001% 수준이라 분석 결과에 영향 없음.
-    검증 통과 처리하되 통계는 보고한다.
+    검증 통과 처리 + 통계 보고.
     """
     for table in ("fact_trade", "fact_total"):
         sql = f"""
@@ -317,7 +339,7 @@ def check_negative_stats(con: duckdb.DuckDBPyConnection, r: ValidationResult):
         result = con.execute(sql).fetchone()
         n_neg = sum(result[:4])
         r.add(f"{table} 음수 통계 (raw 자료 잔여)",
-              True,  # 항상 통과 (정보 수집 목적)
+              True,  # 항상 통과
               f"음수 행 {n_neg}건 / 전체 {result[4]:,}행 "
               f"(exp_dlr {result[0]}, imp_dlr {result[1]}, "
               f"exp_wgt {result[2]}, imp_wgt {result[3]})")
@@ -333,7 +355,6 @@ def check_motie_external(con: duckdb.DuckDBPyConnection, r: ValidationResult):
     CSV 형식 (예시):
         yyyymm,total_exp_dlr,total_imp_dlr
         202401,54784000000,54366000000
-        ...
     """
     csv_path = EXTERNAL_DIR / "motie_monthly.csv"
     if not csv_path.exists():
@@ -382,12 +403,149 @@ def check_motie_external(con: duckdb.DuckDBPyConnection, r: ValidationResult):
 
 
 # ──────────────────────────────────────────────
+# 검증 10: dim_country 행 수
+# ──────────────────────────────────────────────
+
+def check_dim_country_rows(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """dim_country는 외교부 244국과 정확히 일치 (현 시점 합집합 = 244)."""
+    n = con.execute("SELECT COUNT(*) FROM dim_country").fetchone()[0]
+    expected = 244
+    r.add("dim_country 행 수",
+          n == expected,
+          f"{n}행 (기대 {expected})")
+
+
+# ──────────────────────────────────────────────
+# 검증 11: fact ↔ dim_country 매칭률
+# ──────────────────────────────────────────────
+
+def check_fact_dim_country(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """fact_trade/fact_total/meta_calls의 stat_cd가 모두 dim_country에 있어야 함."""
+    for tbl in ("fact_trade", "fact_total", "meta_calls"):
+        n = con.execute(f"""
+            SELECT COUNT(DISTINCT f.stat_cd)
+            FROM {tbl} f
+            LEFT JOIN dim_country d USING (stat_cd)
+            WHERE d.stat_cd IS NULL
+        """).fetchone()[0]
+        r.add(f"{tbl}.stat_cd → dim_country 매칭",
+              n == 0, f"누락 코드 {n}개")
+
+
+# ──────────────────────────────────────────────
+# 검증 12: fact_trade.hs10 → dim_hs10 매칭
+# ──────────────────────────────────────────────
+
+def check_fact_dim_hs10(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """fact_trade의 모든 hs10이 dim_hs10에 있어야 함."""
+    n = con.execute("""
+        SELECT COUNT(DISTINCT f.hs10)
+        FROM fact_trade f
+        LEFT JOIN dim_hs10 d USING (hs10)
+        WHERE d.hs10 IS NULL
+    """).fetchone()[0]
+    r.add("fact_trade.hs10 → dim_hs10 매칭",
+          n == 0, f"누락 hs10 {n}개")
+
+
+# ──────────────────────────────────────────────
+# 검증 13: fact_trade.hs2 → dim_hs2 매칭
+# ──────────────────────────────────────────────
+
+def check_fact_dim_hs2(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """fact_trade의 모든 hs2가 dim_hs2에 있어야 함."""
+    n = con.execute("""
+        SELECT COUNT(DISTINCT f.hs2)
+        FROM fact_trade f
+        LEFT JOIN dim_hs2 d USING (hs2)
+        WHERE d.hs2 IS NULL
+    """).fetchone()[0]
+    r.add("fact_trade.hs2 → dim_hs2 매칭",
+          n == 0, f"누락 hs2 {n}개")
+
+
+# ──────────────────────────────────────────────
+# 검증 14: dim_hs10 시기 무결성
+# ──────────────────────────────────────────────
+
+def check_dim_hs10_temporal(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """dim_hs10: first_yyyymm ≤ last_yyyymm, 모두 200701~현재 fact_trade max 범위 내."""
+    # 14a: first ≤ last
+    n_inv = con.execute("""
+        SELECT COUNT(*) FROM dim_hs10
+        WHERE first_yyyymm > last_yyyymm
+    """).fetchone()[0]
+    r.add("dim_hs10 시기 순서 (first ≤ last)",
+          n_inv == 0, f"위반 {n_inv}건")
+
+    # 14b: 범위 검증 (200701 ~ fact_trade 최대 yyyymm)
+    max_yyyymm = con.execute("SELECT MAX(yyyymm) FROM fact_trade").fetchone()[0]
+    n_out = con.execute(f"""
+        SELECT COUNT(*) FROM dim_hs10
+        WHERE first_yyyymm < 200701 OR last_yyyymm > {max_yyyymm}
+    """).fetchone()[0]
+    r.add(f"dim_hs10 yyyymm 범위 (200701~{max_yyyymm})",
+          n_out == 0, f"범위 외 {n_out}건")
+
+
+# ──────────────────────────────────────────────
+# 검증 15: dim_country 플래그 정합성
+# ──────────────────────────────────────────────
+
+def check_dim_country_flags(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """dim_country 플래그가 fact 데이터와 일관되는지 확인.
+
+    1. is_self=TRUE는 KR만이어야 한다.
+    2. call_status='permanent_fail'인 코드는 fact_total에 *없어야* 한다.
+    3. has_trade=FALSE인 코드는 fact_trade에 *없어야* 한다.
+    4. has_trade=TRUE인 코드는 fact_trade에 *있어야* 한다.
+    """
+    # 15a: is_self
+    bad_self = con.execute("""
+        SELECT COUNT(*) FROM dim_country
+        WHERE is_self AND stat_cd != 'KR'
+    """).fetchone()[0]
+    bad_self_inv = con.execute("""
+        SELECT COUNT(*) FROM dim_country
+        WHERE NOT is_self AND stat_cd = 'KR'
+    """).fetchone()[0]
+    r.add("dim_country.is_self 정합성 (KR만 TRUE)",
+          bad_self == 0 and bad_self_inv == 0,
+          f"KR이 아닌데 TRUE {bad_self}건, KR인데 FALSE {bad_self_inv}건")
+
+    # 15b: call_status = permanent_fail은 fact_total에 없어야
+    bad_perm = con.execute("""
+        SELECT COUNT(*) FROM dim_country d
+        WHERE d.call_status = 'permanent_fail'
+          AND EXISTS (SELECT 1 FROM fact_total f WHERE f.stat_cd = d.stat_cd)
+    """).fetchone()[0]
+    r.add("dim_country.call_status=permanent_fail ↔ fact_total 모순 없음",
+          bad_perm == 0, f"모순 {bad_perm}건")
+
+    # 15c, 15d: has_trade ↔ fact_trade 일관성
+    bad_no_trade_in_trade = con.execute("""
+        SELECT COUNT(*) FROM dim_country d
+        WHERE NOT d.has_trade
+          AND EXISTS (SELECT 1 FROM fact_trade f WHERE f.stat_cd = d.stat_cd)
+    """).fetchone()[0]
+    bad_has_trade_not_in_trade = con.execute("""
+        SELECT COUNT(*) FROM dim_country d
+        WHERE d.has_trade
+          AND NOT EXISTS (SELECT 1 FROM fact_trade f WHERE f.stat_cd = d.stat_cd)
+    """).fetchone()[0]
+    r.add("dim_country.has_trade ↔ fact_trade 일관성",
+          bad_no_trade_in_trade == 0 and bad_has_trade_not_in_trade == 0,
+          f"FALSE인데 fact_trade에 있음 {bad_no_trade_in_trade}건, "
+          f"TRUE인데 fact_trade에 없음 {bad_has_trade_not_in_trade}건")
+
+
+# ──────────────────────────────────────────────
 # 메인
 # ──────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    args = parser.parse_args()
+    parser.parse_args()
 
     if not DB_PATH.exists():
         logger.error(f"DB 파일 없음: {DB_PATH}")
@@ -395,7 +553,7 @@ def main():
         sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("04: 내부 일관성 검증")
+    logger.info("04: 내부 일관성 검증 (v2 — dim 검증 통합)")
     logger.info(f"DB: {DB_PATH}")
     logger.info("=" * 60)
 
@@ -404,10 +562,11 @@ def main():
 
     t_start = datetime.now()
 
+    # 기본 검증 1~9
     logger.info("\n[검증 1a] fact_trade ↔ fact_total 금액 합계 (정확 일치)")
     check_trade_vs_total_dollars(con, r)
 
-    logger.info("\n[검증 1b] fact_trade ↔ fact_total 중량 합계 (허용 오차)")
+    logger.info("\n[검증 1b] fact_trade ↔ fact_total 중량 합계 (정보용)")
     check_trade_vs_total_weights(con, r)
 
     logger.info("\n[검증 2] fact_total 회계 항등식")
@@ -433,6 +592,29 @@ def main():
 
     logger.info("\n[검증 9 (선택)] 산업통상자원부 외부 대조")
     check_motie_external(con, r)
+
+    # dim 검증 10~15 (조건부)
+    if dim_tables_exist(con):
+        logger.info("\n[검증 10] dim_country 행 수")
+        check_dim_country_rows(con, r)
+
+        logger.info("\n[검증 11] fact ↔ dim_country 매칭률")
+        check_fact_dim_country(con, r)
+
+        logger.info("\n[검증 12] fact_trade.hs10 → dim_hs10 매칭")
+        check_fact_dim_hs10(con, r)
+
+        logger.info("\n[검증 13] fact_trade.hs2 → dim_hs2 매칭")
+        check_fact_dim_hs2(con, r)
+
+        logger.info("\n[검증 14] dim_hs10 시기 무결성")
+        check_dim_hs10_temporal(con, r)
+
+        logger.info("\n[검증 15] dim_country 플래그 정합성")
+        check_dim_country_flags(con, r)
+    else:
+        logger.info("\n[검증 10~15] dim 검증 skip "
+                    "(dim 테이블 없음, 03b_build_dims.py 실행 필요)")
 
     con.close()
 
