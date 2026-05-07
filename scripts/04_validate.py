@@ -1,7 +1,7 @@
 """
-04: 적재된 DuckDB의 내부 일관성 검증 (v2)
+04: 적재된 DuckDB의 내부 일관성 검증 (v5)
 
-기존 검증 9종 + dim 검증 6종 = 15종 (motie 포함 시 16종).
+기존 검증 9종 + dim 검증 8종 = 17종 (motie 9a 포함 시 18종, 9b 포함 시 18~19종).
 
 기본 검증:
 1a. fact_trade ↔ fact_total 금액 합계 일관성 (정확 일치)
@@ -13,7 +13,8 @@
 6.  페어 완전성 (fact_trade의 모든 페어가 meta_calls에 있는지)
 7.  시간 연속성 (200701~202605 빠진 월 없음)
 8.  음수 통계 (raw 자료 잔여, 정보용)
-9.  산업통상자원부 외부 대조 (선택, motie_monthly.csv 있을 때)
+9a. 산업통상자원부 월별 외부 대조 (선택, motie_monthly.csv 정확 일치)
+9b. ★v5 신규★ 산업통상자원부 연간 외부 대조 (선택, motie_annual.csv 정보용 통계)
 
 dim 검증 (★v2 신규★, dim 테이블 존재 시만 실행):
 10. dim_country 행 수 = 244
@@ -22,6 +23,8 @@ dim 검증 (★v2 신규★, dim 테이블 존재 시만 실행):
 13. fact_trade.hs2 → dim_hs2 매칭률
 14. dim_hs10 시기 무결성 (first_yyyymm ≤ last_yyyymm, 범위 검증)
 15. dim_country 플래그 정합성 (is_self/call_status/has_trade가 fact와 일치)
+16. ★v3 신규★ dim_country ISO 결측 점검 (EU 제외 모두 NOT NULL — 03c 패치 적용 강제)
+17. ★v4 신규★ dim_hs2 description 결측 점검 (HS99 제외 모두 NOT NULL — 03d 패치 적용 강제)
 
 실행 예:
   python scripts\\04_validate.py
@@ -403,6 +406,105 @@ def check_motie_external(con: duckdb.DuckDBPyConnection, r: ValidationResult):
 
 
 # ──────────────────────────────────────────────
+# 검증 9b (선택): 산업통상자원부 연간 외부 대조 (★v5 신규★)
+# ──────────────────────────────────────────────
+
+def check_motie_annual(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """data/external/motie_annual.csv 가 있으면 fact_total 연간 합계와 대조 (정보용).
+
+    CSV 형식:
+        year,total_exp_dlr,total_imp_dlr
+        2007,371489086000,356845733000
+        ...
+
+    검증 1b(중량 잔차)와 같은 정보용 통계 패턴.
+    산업통상자원부와 관세청 자료 사이에 처리 절차 차이로 0.1~1% 잔차 정상:
+      - 산업통상자원부: 매월 1일 잠정치 발표 (~21일 + 추계)
+      - 관세청: 익월 중순 확정치 발표
+      - 시계열 자료에서 확정치로 갱신되지만 *직전 정정 처리*가 비대칭
+
+    raw 자료 차이 분석 도구 역할. 항상 통과 + 차이 통계 보고.
+    차이율 0.5% 이상 연도만 상세 출력.
+    """
+    csv_path = EXTERNAL_DIR / "motie_annual.csv"
+    if not csv_path.exists():
+        logger.info(f"  - motie 연간 외부 대조 skip (파일 없음: {csv_path.name})")
+        return
+
+    sql = f"""
+        WITH motie AS (
+            SELECT * FROM read_csv_auto('{str(csv_path).replace(chr(92), '/')}')
+        ),
+        kcsdb_yearly AS (
+            SELECT year,
+                   SUM(exp_dlr) AS kcsdb_exp,
+                   SUM(imp_dlr) AS kcsdb_imp
+            FROM fact_total
+            GROUP BY year
+        )
+        SELECT m.year,
+               m.total_exp_dlr,
+               k.kcsdb_exp,
+               m.total_exp_dlr - k.kcsdb_exp AS diff_exp,
+               m.total_imp_dlr,
+               k.kcsdb_imp,
+               m.total_imp_dlr - k.kcsdb_imp AS diff_imp
+        FROM motie m
+        INNER JOIN kcsdb_yearly k USING (year)
+        ORDER BY m.year
+    """
+    rows = con.execute(sql).fetchall()
+    if not rows:
+        r.add("motie 연간 vs fact_total 합계 (정보용)", False,
+              "비교 가능 연도 0")
+        return
+
+    n_total = len(rows)
+    pct_exp = []
+    pct_imp = []
+    for row in rows:
+        motie_e, kcsdb_e, diff_e = row[1], row[2], row[3]
+        motie_i, kcsdb_i, diff_i = row[4], row[5], row[6]
+        pct_exp.append(abs(diff_e) / motie_e * 100 if motie_e else 0)
+        pct_imp.append(abs(diff_i) / motie_i * 100 if motie_i else 0)
+
+    avg_pct = (sum(pct_exp) + sum(pct_imp)) / (2 * n_total)
+    max_e = max(pct_exp)
+    max_i = max(pct_imp)
+    yr_max_e = rows[pct_exp.index(max_e)][0]
+    yr_max_i = rows[pct_imp.index(max_i)][0]
+
+    detail = (f"{n_total}년 비교, 평균 차이율 {avg_pct:.4f}%, "
+              f"최대 수출차이 {max_e:.4f}%({yr_max_e}년), "
+              f"최대 수입차이 {max_i:.4f}%({yr_max_i}년)")
+    r.add("motie 연간 vs fact_total 합계 (정보용)",
+          True,  # 항상 통과 (정보용)
+          detail)
+
+    THRESHOLD = 0.5
+    flagged_idx = [i for i in range(n_total)
+                   if pct_exp[i] >= THRESHOLD or pct_imp[i] >= THRESHOLD]
+
+    if flagged_idx:
+        logger.info(f"      [상세] 차이율 {THRESHOLD}% 이상 연도 ({len(flagged_idx)}건):")
+        logger.info(f"      year | motie 수출(USD)        | KCSDB 수출(USD)       | "
+                    f"차이율(%) | motie 수입(USD)        | KCSDB 수입(USD)       | 차이율(%)")
+        for i in flagged_idx:
+            row = rows[i]
+            mark_e = "*" if pct_exp[i] >= THRESHOLD else " "
+            mark_i_ = "*" if pct_imp[i] >= THRESHOLD else " "
+            logger.info(f"      {row[0]} | {row[1]:>20,} | {row[2]:>20,} | "
+                        f"{pct_exp[i]:>+8.4f}{mark_e}| "
+                        f"{row[4]:>20,} | {row[5]:>20,} | "
+                        f"{pct_imp[i]:>+8.4f}{mark_i_}")
+    else:
+        logger.info(f"      [참고] 모든 비교 연도 차이율 {THRESHOLD}% 미만")
+
+    logger.info(f"      [참고] 차이 원인: 산업통상자원부와 관세청 처리 절차 차이")
+    logger.info(f"      [참고] (잠정치/확정치/정정 처리 비대칭). raw 자료 특성으로 분류")
+
+
+# ──────────────────────────────────────────────
 # 검증 10: dim_country 행 수
 # ──────────────────────────────────────────────
 
@@ -540,6 +642,110 @@ def check_dim_country_flags(con: duckdb.DuckDBPyConnection, r: ValidationResult)
 
 
 # ──────────────────────────────────────────────
+# 검증 16: dim_country ISO 결측 점검 (★v3 신규★)
+# ──────────────────────────────────────────────
+
+def check_dim_country_iso(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """dim_country의 iso3, iso_num 결측 점검 (EU 제외).
+
+    EU는 ISO 3166-1 예약 코드로 iso3/iso_num이 NULL인 게 정상.
+    그 외 코드의 NULL은 외부 자료(외교부 CSV) 입력 결함이거나
+    03c_patch_dims.py 패치 미적용을 시사.
+
+    함정 19(외부 CSV의 'NULL' 문자열 결측)와 결정 25(03c 도입)의 짝.
+    본 검증은 03c 패치 적용을 *강제*하는 역할.
+    """
+    n_iso3_null = con.execute("""
+        SELECT COUNT(*) FROM dim_country
+        WHERE iso3 IS NULL AND stat_cd != 'EU'
+    """).fetchone()[0]
+    n_iso_num_null = con.execute("""
+        SELECT COUNT(*) FROM dim_country
+        WHERE iso_num IS NULL AND stat_cd != 'EU'
+    """).fetchone()[0]
+
+    passed = n_iso3_null == 0 and n_iso_num_null == 0
+    r.add("dim_country ISO 결측 점검 (EU 제외)",
+          passed,
+          f"iso3 NULL {n_iso3_null}건, iso_num NULL {n_iso_num_null}건")
+
+    if not passed:
+        rows = con.execute("""
+            SELECT stat_cd, name_ko_mofa, iso3, iso_num
+            FROM dim_country
+            WHERE (iso3 IS NULL OR iso_num IS NULL) AND stat_cd != 'EU'
+            ORDER BY stat_cd
+        """).fetchall()
+        for row in rows:
+            iso3_v = row[2] if row[2] is not None else "NULL"
+            iso_num_v = str(row[3]) if row[3] is not None else "NULL"
+            logger.warning(f"      {row[0]} ({row[1]}): "
+                           f"iso3={iso3_v}, iso_num={iso_num_v}")
+        logger.warning(f"      [참고] EU만 NULL이 정상 (ISO 3166-1 예약 코드)")
+        logger.warning(f"      [참고] 그 외는 03c_patch_dims.py 적용 또는 "
+                       f"외부 자료 점검 필요")
+
+
+# ──────────────────────────────────────────────
+# 검증 17: dim_hs2 description 결측 점검 (★v4 신규★)
+# ──────────────────────────────────────────────
+
+def check_dim_hs2_descriptions(con: duckdb.DuckDBPyConnection, r: ValidationResult):
+    """dim_hs2의 description_ko, description_en, section 결측 점검 (HS99 제외).
+
+    HS99류는 한국 통계 특수 분류 (관세 부과 외, 통계 목적)로 한국 관세청
+    부류목록에 정의 없음 → NULL 유지가 정상 (결정 2 옵션 a).
+
+    그 외 코드의 NULL은 03d_enrich_dim_hs2.py 패치 미적용 또는 외부 CSV
+    결함을 시사.
+
+    결정 21·23·27의 짝. 본 검증은 03d 패치 적용을 *강제*하는 역할.
+    """
+    n_ko = con.execute("""
+        SELECT COUNT(*) FROM dim_hs2
+        WHERE description_ko IS NULL AND hs2 != '99'
+    """).fetchone()[0]
+    n_en = con.execute("""
+        SELECT COUNT(*) FROM dim_hs2
+        WHERE description_en IS NULL AND hs2 != '99'
+    """).fetchone()[0]
+    n_sect = con.execute("""
+        SELECT COUNT(*) FROM dim_hs2
+        WHERE section IS NULL AND hs2 != '99'
+    """).fetchone()[0]
+
+    passed = n_ko == 0 and n_en == 0 and n_sect == 0
+    r.add("dim_hs2 description 결측 점검 (HS99 제외)",
+          passed,
+          f"description_ko NULL {n_ko}건, description_en NULL {n_en}건, "
+          f"section NULL {n_sect}건")
+
+    if not passed:
+        rows = con.execute("""
+            SELECT hs2,
+                   description_ko IS NULL AS ko_null,
+                   description_en IS NULL AS en_null,
+                   section        IS NULL AS sect_null
+            FROM dim_hs2
+            WHERE hs2 != '99'
+              AND (description_ko IS NULL
+                   OR description_en IS NULL
+                   OR section IS NULL)
+            ORDER BY hs2
+        """).fetchall()
+        for row in rows:
+            ko_v = "NULL" if row[1] else "OK"
+            en_v = "NULL" if row[2] else "OK"
+            sect_v = "NULL" if row[3] else "OK"
+            logger.warning(f"      HS{row[0]}: "
+                           f"ko={ko_v}, en={en_v}, section={sect_v}")
+        logger.warning(f"      [참고] HS99만 NULL이 정상 "
+                       f"(한국 통계 특수 분류, 부류목록 미정의)")
+        logger.warning(f"      [참고] 그 외는 03d_enrich_dim_hs2.py 적용 또는 "
+                       f"외부 CSV 점검 필요")
+
+
+# ──────────────────────────────────────────────
 # 메인
 # ──────────────────────────────────────────────
 
@@ -553,7 +759,7 @@ def main():
         sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("04: 내부 일관성 검증 (v2 — dim 검증 통합)")
+    logger.info("04: 내부 일관성 검증 (v5 — motie 연간 외부 대조 추가)")
     logger.info(f"DB: {DB_PATH}")
     logger.info("=" * 60)
 
@@ -590,10 +796,13 @@ def main():
     logger.info("\n[검증 8] 음수 통계 (raw 자료 잔여)")
     check_negative_stats(con, r)
 
-    logger.info("\n[검증 9 (선택)] 산업통상자원부 외부 대조")
+    logger.info("\n[검증 9a (선택)] 산업통상자원부 월별 외부 대조")
     check_motie_external(con, r)
 
-    # dim 검증 10~15 (조건부)
+    logger.info("\n[검증 9b (선택)] 산업통상자원부 연간 외부 대조 (정보용)")
+    check_motie_annual(con, r)
+
+    # dim 검증 10~16 (조건부)
     if dim_tables_exist(con):
         logger.info("\n[검증 10] dim_country 행 수")
         check_dim_country_rows(con, r)
@@ -612,8 +821,14 @@ def main():
 
         logger.info("\n[검증 15] dim_country 플래그 정합성")
         check_dim_country_flags(con, r)
+
+        logger.info("\n[검증 16] dim_country ISO 결측 점검")
+        check_dim_country_iso(con, r)
+
+        logger.info("\n[검증 17] dim_hs2 description 결측 점검")
+        check_dim_hs2_descriptions(con, r)
     else:
-        logger.info("\n[검증 10~15] dim 검증 skip "
+        logger.info("\n[검증 10~17] dim 검증 skip "
                     "(dim 테이블 없음, 03b_build_dims.py 실행 필요)")
 
     con.close()
